@@ -1,117 +1,115 @@
-import pickle
-import numpy as np
-import os 
 import argparse
+import time
 
 from tqdm import tqdm
+import numpy as np
+import torch
+from torch.utils.data import DataLoader
 
-from dataGenerator import dataGenerator
 from agent import Network
 from trainer import Trainer
-from showGridCells import showGridCells
+from data_generator import DataGenerator, RatSimulatedDataset
+from show_grid_cells import show_grid_cells
+import utils
 
-model_checkpoint_path = './model_checkpoint/model.pkl'
-
-# HYPERPARAMETERS
+# HYPERPARAMETERS:: MODEL
 lstm_units = 128
 linear_units = 512
 place_units = 256
 head_units = 12
 
+# HYPERPARAMETERS:: OPTIMIZER
 learning_rate = 1e-5
 clipping = 1e-5
 weight_decay = 1e-5
-len_traj = 10
-SGD_steps = 300000
-len_steps = 800
+
+# HYPERPARAMETERS:: DATASET
+num_train_trajectories = 5000
+num_test_trajectories = 10
+num_display_trajectories = 500 # Number of trajectories used to display the activity maps
+batch_traj = 100 # split count of trajectories
+
+batch_timesteps = 100
+num_batch_timesteps = 8
+num_timesteps = batch_timesteps * num_batch_timesteps # num_batch * batch_size
+
+# HYPERPARAMETERS:: TRAINING
+max_iteration = 300000
 num_features = 3 # num_features = [velocity, sin(angVel), cos(angVel)]
+num_epochs = 5
 
-bins = 32
+# Args::
+bins = 32 # for drawing
+model_checkpoint_path = './model_checkpoint/model.pkl'
+result_dir_path = './results'
 
-#Number of trajectories to generate and use as data to train the network
-num_trajectories = 500
 
-#Number of trajectories used to display the activity maps
-showCellsTrajectories = 500
-
-#Initialize place cells centers and head cells centers. Every time the program starts they are the same
+# Initialize place cells centers and head cells centers. Every time the program starts they are the same
 rs = np.random.RandomState(seed=10)
-#Generate 256 Place Cell centers
+# Generate 256 Place Cell centers
 place_cell_centers = rs.uniform(0, 2.2, size=(place_units,2))
-#Generate 12 Head Direction Cell centers
+# Generate 12 Head Direction Cell centers
 head_cell_centers = rs.uniform(-np.pi, np.pi, size=(head_units))
 
-#Class that generate the trajectory and allows to compute the Place Cell and Head Cell distributions
-data_generator = dataGenerator(len_steps, num_features, place_units, head_units)
+# Class that generate the trajectory and allows to compute the Place Cell and Head Cell distributions
+data_generator = DataGenerator(place_units, head_units, place_cell_centers, head_cell_centers, num_features, batch_timesteps)
 
-global_step = 0
-
-
-def prepare_test_data():
-    if os.path.isfile("./data/trajectoriesDataTesting.pickle"):
-        print("\nLoading test data..")
-        data = pickle.load(open("./data/trajectoriesDataTesting.pickle","rb"))
-        input_data_test = data['input_data']
-        pos_test = data['pos']
-        angle_test = data['angle']
-
-    # Create new data
+def load_test_data(num_traj=10, num_test_timesteps=800):
+    data = utils.load_object('./data/train_data.pickle')
+    
+    if data is not None:
+        X_test, Y_test, position_test, angle_test = data['X_test'], data['Y_test'], data['position'], data['angle']
+        print("> Test data are loaded successfully!")
     else:
-        if not os.path.exists("./data/"):
-            os.makedirs("./data/")
-        print("\nCreating test data..")
+        print("> Test data not found. Creating test data..")
+        X_test, Y_test, position_test, angle_test = data_generator.generate_dataset(num_traj, num_test_timesteps, train=False)
 
-        input_data_test, pos_test, angle_test = data_generator.generateData(num_traj=10)
-
-        dict = {
-            "input_data": input_data_test,
-            "pos": pos_test,
+        utils.save_object({
+            "X_test": X_test,
+            "Y_test": Y_test,
+            "position": position_test,
             "angle": angle_test
-        }
-        with open('./data/trajectoriesDataTesting.pickle', 'wb') as f:
-            pickle.dump(dict, f)
+        }, './data/train_data.pickle')
 
-    init_LSTM_state = data_generator.generate_lstm_init_state(10, pos_test, angle_test, place_cell_centers, head_cell_centers)
-
-    return input_data_test, init_LSTM_state, pos_test
-
+    return X_test, Y_test, position_test, angle_test
 
 # todo: 이것도 Trainer 안으로 넣어도 될 듯
 def train_model(trainer):
-    global global_step
-
     # Load testing data
-    inputDataTest, init_LSTM_state, posTest = prepare_test_data()
+    print("\n\n-----------------------------------")
+    print("Try to load test dataset..")
+    X_test, Y_test, positions_test, angles_test = load_test_data(num_test_trajectories, num_batch_timesteps)
 
-    while (global_step<SGD_steps):
+    X_test = torch.Tensor(X_test)
+    Y_test = torch.Tensor(Y_test)
+
+    testing_factor = 2
+    testing_factor_iter = testing_factor*num_epochs*(num_train_trajectories/batch_traj)*num_batch_timesteps
+
+    print("\n\n-----------------------------------")
+    print("Training Started..")
+    while (trainer.global_iteration < max_iteration):
+
         # Create training Data
-        print("\nGenerating Train Data from Simulation..")
-        inputData, pos, angle = data_generator.generate_data(num_traj=num_trajectories)
+        print("\n> Generating Train Data from Simulation..")
+        X_train, Y_train, _, _ = data_generator.generate_dataset(num_train_trajectories, num_batch_timesteps)
+        train_dataset = RatSimulatedDataset(X_train, Y_train)
+        train_dataloader = DataLoader(train_dataset, batch_size=batch_traj, shuffle=True)
 
-        labelData = np.zeros((num_trajectories, len_steps, place_units + head_units))
+        print("\n> Train with Generated train data..")
+        for epoch in range(num_epochs):
+            for idx, (batchX, batchY) in enumerate(tqdm(train_dataloader, desc=f">> Train epoch: #{epoch}, iter: #{trainer.global_iteration}", position=0)):
+                trainer.train(batchX, batchY)
+                trainer.global_iteration += num_batch_timesteps
+        
 
-        for t in range(len_steps):
-            labelData[:,t, :place_units] = data_generator.computePlaceCellsDistrib(pos[:,t], place_cell_centers)
-            labelData[:,t, place_units:] = data_generator.computeHeadCellsDistrib(angle[:,t], head_cell_centers)
+        if trainer.global_iteration % testing_factor_iter == 0:
+            print("\n> Testing the model")
+            trainer.inference(X_test, Y_test, positions_test, place_cell_centers, num_test_trajectories, num_timesteps)
 
-        print("\nTrain with Generated train data..")
-        for batch_start_idx in tqdm(range(0, num_trajectories, len_traj)):
-            batch_end_idx = batch_start_idx + len_traj
-            #return a tensor of shape 10,800,3
-            batchX = inputData[batch_start_idx:batch_end_idx]
-            #return a tensor of shape 10,800,256+12
-            batchY = labelData[batch_start_idx:batch_end_idx]
+            print("\n> Global step:", trainer.global_iteration,"Saving the model..\n")
+            trainer.save_model(model_checkpoint_path)
 
-            trainer.train(batchX, batchY, global_step)
-
-            global_step += len_steps/100
-            
-            if (global_step%len_steps == 0):
-                print("\n>>Testing the model")
-                trainer.inference(inputDataTest, init_LSTM_state, posTest, place_cell_centers, global_step)
-
-                print(">>Global step:", global_step,"Saving the model..\n")
-                trainer.save_model(global_step, model_checkpoint_path)
 
 
 if __name__ == '__main__':
@@ -121,28 +119,29 @@ if __name__ == '__main__':
     args = parser.parse_args()
 
     try:
+        print("\n\n-----------------------------------")
+        print("Initialize the model, trainer..")
         model = Network(place_units, head_units, lstm_units, linear_units, num_features, 0.5)
-        trainer = Trainer(model, place_units, head_units, len_steps, learning_rate, clipping, weight_decay, len_traj)
+        trainer = Trainer(model, num_timesteps, batch_timesteps, learning_rate, clipping, weight_decay)
 
-        if os.path.exists("model_checkpoint"):
-            print("Loading the model..")
-            global_step = trainer.load_model(model_checkpoint_path)
-            print(f"Model updated at global step: {global_step} loaded")
+        print("\n\n-----------------------------------")
+        print("Loading the model..")
+        if trainer.load_model(model_checkpoint_path):
+            print(f"> Model updated at global_iteration step: {trainer.global_iteration} loaded")
 
         if(args.mode == "train"):
-            os.makedirs("./results", exist_ok=True)
-            os.makedirs("./model_checkpoint", exist_ok=True)
             train_model(trainer)
 
         elif(args.mode == "showcells"):
-            showGridCells(
-                model, data_generator, showCellsTrajectories, len_steps, place_units,
-                head_units, linear_units, bins, place_cell_centers, head_cell_centers
-                )
+            show_grid_cells(
+                model, data_generator, num_display_trajectories, batch_traj, num_timesteps, num_batch_timesteps, batch_timesteps,
+                place_units, linear_units, bins
+            )
 
             
     except (KeyboardInterrupt,SystemExit):
-        print("\n\nProgram shut down, saving the model..")
-        # trainer.save_model(global_step, model_checkpoint_path)
-        print("\n\nModel saved!\n\n")
+        print("\n\n-----------------------------------")
+        print("Program shut down, saving the model..")
+        # trainer.save_model(model_checkpoint_path)
+        print("> Model saved!\n\n")
         raise

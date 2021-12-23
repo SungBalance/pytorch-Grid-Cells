@@ -5,6 +5,8 @@ class Network(nn.Module):
     def __init__(self, place_units, head_units, lstm_units, linear_units, num_features, dropout_prob=0.5):
         super(Network, self).__init__()
 
+        self.place_units = place_units
+        self.head_units = head_units
         self.lstm_units = lstm_units
 
         # LSTM_initialization
